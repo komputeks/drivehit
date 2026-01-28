@@ -1,559 +1,1664 @@
-/******************************************************
- * APPS SCRIPT GALLERY SYSTEM v1.0.0 - 
- ******************************************************/
-// =============================
-// CONFIGURATION
-// =============================
-const ROOT_FOLDER_NAME = 'UploadedForWeb';
-const UNCATEGORIZED = 'Uncategorized';
-const AUTO_CATEGORIZED = 'AutoCategorized';
-const ARCHIVE = 'Archive';
-const SHEET_NAME = 'AssetsDB';
-const STATUS_VALUES = ['published', 'hidden', 'archived'];
-const SCAN_INTERVAL_MINUTES = 1;
-// SECURITY TOKENS
-const INTERNAL_TOKEN = PropertiesService.getScriptProperties().getProperty('INTERNAL_TOKEN');
-const ISR_SECRET = PropertiesService.getScriptProperties().getProperty('ISR_SECRET');
-const NEXTJS_REVALIDATE_URL = PropertiesService.getScriptProperties().getProperty('NEXTJS_REVALIDATE_URL');
-const THUMB_WIDTH = 400;
-const THUMB_HEIGHT = 300;
-let editInProgress = false;
-let ISR_QUEUE = new Set();
+/***********************************************************
+ * DriveHit Backend - code.gs
+ * Enterprise SaaS Backend (Google Apps Script)
+ * Version: 1.0.0
+ ***********************************************************/
 
-// =============================
-// ENTRY POINT
-// =============================
-function bootstrap() {
-  const root = getOrCreateFolder_(ROOT_FOLDER_NAME);
-  const uncategorized = getOrCreateSubfolder_(root, UNCATEGORIZED);
-  const auto = getOrCreateSubfolder_(root, AUTO_CATEGORIZED);
-  getOrCreateSubfolder_(root, ARCHIVE);
-  ensurePublic_(root);
-  ensurePublic_(uncategorized);
-  ensurePublic_(auto);
-  const sheet = getOrCreateSheet_();
-  setupSheet_(sheet); // will auto-add Likes & Comments columns if missing
-  installTimeTrigger_();
-  runIngestion_(); // internal run, token not required
+/* =========================================================
+   GLOBAL CONFIG
+========================================================= */
+
+const CFG = {
+  API_VER: "v1",
+  MAX_PAGE: 100,
+  DEF_PAGE: 24,
+  REQ_TTL: 300000, // 5 min
+  CACHE_TTL: 300, // seconds
+  RATE_LIMIT: 300, // per hour
+  LOG: true
+};
+
+
+/* =========================================================
+   ENTRYPOINTS
+========================================================= */
+
+/**
+ * HTTP GET
+ */
+function doGet(e) {
+  return main_(e, "GET");
 }
 
-/******************************************************
- * 🚀  * Ingestion Pipeline (REQUIRED)
- ******************************************************/
-function runIngestion_() {
-  const lock = LockService.getScriptLock();
-  if (!lock.tryLock(30000)) return;
+/**
+ * HTTP POST
+ */
+function doPost(e) {
+  return main_(e, "POST");
+}
+
+
+/**
+ * Main dispatcher
+ */
+function main_(e, method) {
+  try {
+    const req = parseReq_(e, method);
+    const res = routeReq_(req);
+
+    return jsonOut_(res);
+
+  } catch (err) {
+    logErr_(err);
+
+    return jsonOut_({
+      ok: false,
+      error: err.message || "SERVER_ERROR"
+    }, 500);
+  }
+}
+
+
+/* =========================================================
+   REQUEST PARSER
+========================================================= */
+
+function parseReq_(e, method) {
+
+  const p = e.parameter || {};
+  const h = e.headers || {};
+  const b = e.postData ? e.postData.contents : null;
+
+  let body = null;
+
+  if (b) {
+    try {
+      body = JSON.parse(b);
+    } catch (err) {
+      body = null;
+    }
+  }
+
+  return {
+    method: method,
+    path: (p.path || "").replace(/^\/+/, ""),
+    query: p,
+    headers: h,
+    body: body,
+    raw: e
+  };
+}
+
+
+/* =========================================================
+   ROUTER
+========================================================= */
+
+function routeReq_(req) {
+
+  const seg = req.path.split("/").filter(Boolean);
+
+  if (!seg.length) {
+    return apiInfo_();
+  }
+
+  const ver = seg[0];
+
+  if (ver !== CFG.API_VER) {
+    return err_("INVALID_VERSION");
+  }
+
+  const mod = seg[1] || "";
+
+  switch (mod) {
+
+    case "items":
+      return itemsApi_(req, seg);
+
+    case "engagement":
+      return engageApi_(req, seg);
+
+    case "admin":
+      return adminApi_(req, seg);
+
+    case "revalidate":
+      return isrApi_(req, seg);
+
+    case "users":
+      return usersApi_(req, seg);
+
+    default:
+      return err_("NOT_FOUND");
+  }
+}
+
+
+/* =========================================================
+   API ROOT
+========================================================= */
+
+function apiInfo_() {
+
+  return {
+    ok: true,
+    name: "DriveHit API",
+    version: CFG.API_VER,
+    ts: Date.now()
+  };
+}
+
+
+/* =========================================================
+   ITEMS API (PUBLIC)
+========================================================= */
+
+function itemsApi_(req, seg) {
+
+  if (req.method !== "GET") {
+    return err_("METHOD_NOT_ALLOWED");
+  }
+
+  return listItems_(req);
+}
+
+
+/* =========================================================
+   ENGAGEMENT API
+========================================================= */
+
+function engageApi_(req) {
+
+  if (req.method !== "POST") {
+    return err_("METHOD_NOT_ALLOWED");
+  }
+
+  verifySig_(req);
+
+  return handleEngage_(req);
+}
+
+
+/* =========================================================
+   ADMIN API
+========================================================= */
+
+function adminApi_(req) {
+
+  verifyAdmin_(req);
+
+  return handleAdmin_(req);
+}
+
+
+/* =========================================================
+   ISR API
+========================================================= */
+
+function isrApi_(req) {
+
+  verifyIsr_(req);
+
+  return handleIsr_(req);
+}
+
+
+/* =========================================================
+   USERS API
+========================================================= */
+
+function usersApi_(req) {
+
+  if (req.method !== "POST") {
+    return err_("METHOD_NOT_ALLOWED");
+  }
+
+  verifySig_(req);
+
+  return handleUser_(req);
+}
+
+
+/* =========================================================
+   RESPONSE HELPERS
+========================================================= */
+
+function jsonOut_(obj, code) {
+
+  const out = ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+
+  if (code) {
+    out.setResponseCode(code);
+  }
+
+  return out;
+}
+
+
+function err_(msg) {
+
+  return {
+    ok: false,
+    error: msg
+  };
+}
+
+
+/* =========================================================
+   PROPERTY HELPERS
+========================================================= */
+
+function prop_(k) {
+
+  return PropertiesService
+    .getScriptProperties()
+    .getProperty(k);
+}
+
+
+function propReq_(k) {
+
+  const v = prop_(k);
+
+  if (!v) {
+    throw new Error("MISSING_PROP_" + k);
+  }
+
+  return v;
+}
+
+
+/* =========================================================
+   LOGGING
+========================================================= */
+
+function log_(msg) {
+
+  if (!CFG.LOG) return;
+
+  console.log("[DriveHit]", msg);
+}
+
+
+function logErr_(e) {
+
+  console.error("[DriveHit ERR]", e, e.stack);
+}
+
+
+/* =========================================================
+   UTILS
+========================================================= */
+
+function now_() {
+  return Date.now();
+}
+
+
+function uid_() {
+  return Utilities.getUuid();
+}
+
+
+function hash_(s) {
+
+  return Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    s
+  ).map(b => ('0' + (b & 0xff).toString(16)).slice(-2)).join('');
+}
+
+
+function hmac_(s, key) {
+
+  return Utilities.computeHmacSha256Signature(
+    s,
+    key
+  ).map(b => ('0' + (b & 0xff).toString(16)).slice(-2)).join('');
+}
+
+
+function sleep_(ms) {
+  Utilities.sleep(ms);
+}
+
+
+function clamp_(v, min, max) {
+  return Math.min(Math.max(v, min), max);
+}
+
+
+function toInt_(v, d) {
+
+  v = parseInt(v, 10);
+
+  return isNaN(v) ? d : v;
+}
+
+/* =========================================================
+   AUTH / SECURITY CORE
+========================================================= */
+
+
+/* =========================================================
+   SIGNATURE VERIFICATION
+========================================================= */
+
+/**
+ * Verify signed client request (Next.js, SDK, etc)
+ * Headers:
+ *  x-ts
+ *  x-sig
+ */
+function verifySig_(req) {
+
+  const ts = req.headers["x-ts"];
+  const sig = req.headers["x-sig"];
+
+  if (!ts || !sig) {
+    throw new Error("MISSING_SIGNATURE");
+  }
+
+  const now = now_();
+
+  if (Math.abs(now - Number(ts)) > CFG.REQ_TTL) {
+    throw new Error("EXPIRED_REQUEST");
+  }
+
+  const secret = propReq_("API_SIGNING_SECRET");
+
+  const base = [
+    req.method,
+    req.path,
+    ts,
+    JSON.stringify(req.body || {})
+  ].join("|");
+
+  const calc = hmac_(base, secret);
+
+  if (calc !== sig) {
+    throw new Error("INVALID_SIGNATURE");
+  }
+
+  rateCheck_(req);
+}
+
+
+/* =========================================================
+   READ SIGNATURE (PREMIUM READ)
+========================================================= */
+
+function verifyReadSig_(req) {
+
+  const sig = req.headers["x-read-sig"];
+  const ts = req.headers["x-read-ts"];
+
+  if (!sig || !ts) {
+    throw new Error("MISSING_READ_SIG");
+  }
+
+  if (Math.abs(now_() - ts) > CFG.REQ_TTL) {
+    throw new Error("EXPIRED_READ");
+  }
+
+  const sec = propReq_("API_READ_SECRET");
+
+  const base = req.path + "|" + ts;
+
+  if (hmac_(base, sec) !== sig) {
+    throw new Error("INVALID_READ_SIG");
+  }
+}
+
+
+/* =========================================================
+   ADMIN AUTH
+========================================================= */
+
+function verifyAdmin_(req) {
+
+  verifySig_(req);
+
+  const email = req.headers["x-user-email"];
+
+  if (!email) {
+    throw new Error("NO_ADMIN_EMAIL");
+  }
+
+  const admins = propReq_("ADMIN_EMAILS")
+    .split(",")
+    .map(e => e.trim());
+
+  if (admins.indexOf(email) === -1) {
+    throw new Error("NOT_ADMIN");
+  }
+}
+
+
+/* =========================================================
+   ISR AUTH
+========================================================= */
+
+function verifyIsr_(req) {
+
+  const sec = propReq_("NEXTJS_ISR_SECRET");
+
+  const s = req.headers["x-isr-secret"];
+
+  if (!s || s !== sec) {
+    throw new Error("INVALID_ISR_SECRET");
+  }
+}
+
+
+/* =========================================================
+   RATE LIMITING
+========================================================= */
+
+function rateCheck_(req) {
+
+  const ip =
+    req.headers["x-forwarded-for"] ||
+    req.headers["client-ip"] ||
+    "na";
+
+  const key = "rl:" + ip;
+
+  const cache = CacheService.getScriptCache();
+
+  let v = cache.get(key);
+
+  if (!v) {
+    cache.put(key, "1", 3600);
+    return;
+  }
+
+  v = Number(v) + 1;
+
+  if (v > CFG.RATE_LIMIT) {
+    throw new Error("RATE_LIMIT");
+  }
+
+  cache.put(key, String(v), 3600);
+}
+
+
+/* =========================================================
+   ABUSE TRACKING
+========================================================= */
+
+function abuseLog_(req, reason) {
 
   try {
-    const sheet = getOrCreateSheet_();
-    const index = buildSheetIndex_(sheet);
-    const updatedRows = [];
 
-    // Scan Uncategorized
-    scanFolderIncremental_(
-      getFolder_(UNCATEGORIZED),
-      UNCATEGORIZED,
-      index,
-      updatedRows
-    );
+    const sh = getSysSheet_("abuse");
 
-    // Scan AutoCategorized recursively
-    scanAutoCategoriesIncremental_(
-      getFolder_(AUTO_CATEGORIZED),
-      index,
-      updatedRows,
-      ''
-    );
+    sh.appendRow([
+      now_(),
+      req.headers["x-forwarded-for"] || "",
+      req.headers["user-agent"] || "",
+      reason,
+      JSON.stringify(req.body || {})
+    ]);
 
-    // Write updates
-    if (updatedRows.length) {
-      sheet
-        .getRange(2, 1, updatedRows.length, updatedRows[0].length)
-        .setValues(updatedRows);
+  } catch (e) {
+    logErr_(e);
+  }
+}
+
+
+/* =========================================================
+   VALIDATION
+========================================================= */
+
+function need_(v, name) {
+
+  if (v === undefined || v === null || v === "") {
+    throw new Error("MISSING_" + name);
+  }
+
+  return v;
+}
+
+
+function needNum_(v, name) {
+
+  v = Number(v);
+
+  if (isNaN(v)) {
+    throw new Error("INVALID_" + name);
+  }
+
+  return v;
+}
+
+
+function needStr_(v, name, max) {
+
+  if (!v || typeof v !== "string") {
+    throw new Error("INVALID_" + name);
+  }
+
+  if (max && v.length > max) {
+    throw new Error("TOO_LONG_" + name);
+  }
+
+  return v.trim();
+}
+
+
+/* =========================================================
+   REQUEST FINGERPRINT
+========================================================= */
+
+function fp_(req) {
+
+  return hash_([
+    req.headers["user-agent"] || "",
+    req.headers["x-forwarded-for"] || "",
+    req.headers["accept-language"] || ""
+  ].join("|"));
+}
+
+
+
+
+
+/* =========================================================
+   SHEETS DATABASE LAYER
+========================================================= */
+
+
+/* =========================================================
+   TABLE DEFINITIONS
+========================================================= */
+
+const DB = {
+
+  items: {
+    sheet: "items",
+    cols: [
+      "id",
+      "name",
+      "slug",
+      "type",
+      "mime",
+      "url",
+      "thumb",
+      "size",
+      "cat",
+      "tags",
+      "likes",
+      "comments",
+      "views",
+      "created",
+      "updated",
+      "status",
+      "hash"
+    ]
+  },
+
+  users: {
+    sheet: "users",
+    cols: [
+      "id",
+      "email",
+      "name",
+      "created",
+      "last",
+      "meta"
+    ]
+  },
+
+  engage: {
+    sheet: "engagement",
+    cols: [
+      "id",
+      "item",
+      "type",
+      "user",
+      "val",
+      "created"
+    ]
+  },
+
+  abuse: {
+    sheet: "abuse",
+    cols: [
+      "ts",
+      "ip",
+      "ua",
+      "reason",
+      "data"
+    ]
+  },
+
+  jobs: {
+    sheet: "jobs",
+    cols: [
+      "id",
+      "type",
+      "status",
+      "data",
+      "created",
+      "updated"
+    ]
+  }
+
+};
+
+
+/* =========================================================
+   SPREADSHEET ACCESS
+========================================================= */
+
+function db_() {
+
+  const props = PropertiesService.getScriptProperties();
+
+  let id = props.getProperty("DB_ID");
+
+  let ss;
+
+  if (id) {
+    try {
+      ss = SpreadsheetApp.openById(id);
+    } catch (e) {
+      ss = null;
     }
+  }
 
-    // ISR revalidation
-    ISR_QUEUE.forEach(slug => pushNextJSRevalidate_(slug));
-    ISR_QUEUE.clear();
+  if (!ss) {
 
+    ss = SpreadsheetApp.create("DriveHit-DB");
+
+    props.setProperty("DB_ID", ss.getId());
+  }
+
+  return ss;
+}
+
+
+/* =========================================================
+   GET OR CREATE SHEET
+========================================================= */
+
+function getSysSheet_(name) {
+
+  const ss = db_();
+
+  let sh = ss.getSheetByName(name);
+
+  if (!sh) {
+    sh = ss.insertSheet(name);
+  }
+
+  bootSheet_(sh, name);
+
+  return sh;
+}
+
+
+/* =========================================================
+   BOOTSTRAP SHEET
+========================================================= */
+
+function bootSheet_(sh, name) {
+
+  const def = DB[name];
+
+  if (!def) {
+    throw new Error("UNKNOWN_TABLE_" + name);
+  }
+
+  const rng = sh.getRange(1, 1, 1, def.cols.length);
+
+  const vals = rng.getValues()[0];
+
+  let ok = true;
+
+  for (let i = 0; i < def.cols.length; i++) {
+
+    if (vals[i] !== def.cols[i]) {
+      ok = false;
+      break;
+    }
+  }
+
+  if (!ok) {
+
+    sh.clear();
+
+    sh.getRange(1, 1, 1, def.cols.length)
+      .setValues([def.cols]);
+
+    sh.setFrozenRows(1);
+  }
+}
+
+
+/* =========================================================
+   LOCK
+========================================================= */
+
+function dbLock_(fn) {
+
+  const lock = LockService.getScriptLock();
+
+  lock.waitLock(30000);
+
+  try {
+    return fn();
   } finally {
     lock.releaseLock();
   }
 }
 
-// =============================
-// ON EDIT HANDLER (TOKEN-PROTECTED FOR EXTERNAL EDITS)
-// =============================
-function onEdit(e) {
-  assertToken_(e); // enforce token for all edits
-  if (editInProgress) return;
-  editInProgress = true;
-  try {
-    const sh = e.range.getSheet();
-    if (sh.getName() !== SHEET_NAME || e.range.getRow() === 1) return;
-    const row = e.range.getRow();
-    const col = e.range.getColumn();
-    const data = sh.getRange(row, 1, 1, sh.getLastColumn()).getValues()[0]; // use dynamic last column
-    const [id, name, categoryPath, categorySlug, slug, status] = data;
-    if (!id) return;
-    const file = DriveApp.getFileById(id);
-    // Rename in Drive
-    if (col === 2 && file.getName() !== name) {
-      file.setName(name);
-      ISR_QUEUE.add(slug);
-    }
-    // Move to category
-    if (col === 3) {
-      moveFileToCategory_(file, categoryPath);
-      ISR_QUEUE.add(slug);
-    }
-    // Status changes (archive / restore)
-    if (col === 6) {
-      if (status === 'archived') softDeleteFile_(file);
-      if (status === 'published') restoreFile_(file, categoryPath);
-      ISR_QUEUE.add(slug);
-    }
-    ISR_QUEUE.forEach(s => pushNextJSRevalidate_(s));
-    ISR_QUEUE.clear();
-  } finally {
-    editInProgress = false;
-  }
+
+/* =========================================================
+   INDEX CACHE
+========================================================= */
+
+function idxKey_(tbl) {
+  return "idx:" + tbl;
 }
 
-// =============================
-// DRIVE FOLDER HELPERS
-// =============================
-function getOrCreateFolder_(name) {
-  const f = DriveApp.getFoldersByName(name);
-  return f.hasNext() ? f.next() : DriveApp.createFolder(name);
-}
-function getOrCreateSubfolder_(parent, name) {
-  const f = parent.getFoldersByName(name);
-  return f.hasNext() ? f.next() : parent.createFolder(name);
-}
-function getFolder_(name) {
-  return DriveApp.getFoldersByName(name).next();
-}
-function ensurePublic_(item) {
-  if (item.getSharingAccess() !== DriveApp.Access.ANYONE) {
-    item.setSharing(DriveApp.Access.ANYONE, DriveApp.Permission.VIEW);
-  }
-}
-function moveFileToCategory_(file, category) {
-  const root = getFolder_(AUTO_CATEGORIZED);
-  const target = getOrCreateSubfolder_(root, category);
-  const parents = file.getParents();
-  while (parents.hasNext()) parents.next().removeFile(file);
-  target.addFile(file);
-}
-function softDeleteFile_(file) {
-  const archive = getOrCreateSubfolder_(getFolder_(ROOT_FOLDER_NAME), ARCHIVE);
-  const parents = file.getParents();
-  while (parents.hasNext()) parents.next().removeFile(file);
-  archive.addFile(file);
-}
-function restoreFile_(file, category) {
-  moveFileToCategory_(file, category);
-}
 
-// =============================
-// SHEET HELPERS
-// =============================
-function getOrCreateSheet_() {
-  let ss;
-  const files = DriveApp.getFilesByName(SHEET_NAME);
-  if (files.hasNext()) {
-    ss = SpreadsheetApp.open(files.next());
-  } else {
-    ss = SpreadsheetApp.create(SHEET_NAME);
-    ensurePublic_(DriveApp.getFileById(ss.getId()));
-  }
-  let sh = ss.getSheetByName(SHEET_NAME);
-  if (!sh) {
-    sh = ss.getSheets()[0];
-    sh.setName(SHEET_NAME);
-  }
-  return sh;
-}
+function getIdx_(tbl) {
 
-// 🚀 Ensure Likes & Comments columns exist
-function setupSheet_(sh) {
-  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
-  let modified = false;
+  const cache = CacheService.getScriptCache();
 
-  if (!headers.includes('Likes')) {
-    sh.insertColumnAfter(headers.length);
-    sh.getRange(1, headers.length + 1).setValue('Likes');
-    modified = true;
-  }
-  if (!headers.includes('Comments')) {
-    sh.insertColumnAfter(sh.getLastColumn());
-    sh.getRange(1, sh.getLastColumn()).setValue('Comments');
-    modified = true;
+  const k = idxKey_(tbl);
+
+  let v = cache.get(k);
+
+  if (v) {
+    return JSON.parse(v);
   }
 
-  // Fill missing Likes/Comments in existing rows
-  const lastRow = sh.getLastRow();
-  const lastCol = sh.getLastColumn();
-  if (modified && lastRow > 1) {
-    const data = sh.getRange(2, 1, lastRow - 1, lastCol).getValues();
-    const likesIndex = sh.getRange(1, 1, 1, lastCol).getValues()[0].indexOf('Likes');
-    const commentsIndex = sh.getRange(1, 1, 1, lastCol).getValues()[0].indexOf('Comments');
+  const idx = buildIdx_(tbl);
 
-    for (let i = 0; i < data.length; i++) {
-      if (likesIndex >= 0 && (data[i][likesIndex] === '' || data[i][likesIndex] === null)) data[i][likesIndex] = 0;
-      if (commentsIndex >= 0 && (data[i][commentsIndex] === '' || data[i][commentsIndex] === null)) data[i][commentsIndex] = '[]';
-    }
-    sh.getRange(2, 1, data.length, lastCol).setValues(data);
-  }
+  cache.put(k, JSON.stringify(idx), CFG.CACHE_TTL);
 
-  // Original headers setup
-  if (sh.getLastRow() === 0) {
-    sh.appendRow([
-      'FileId','FileName','Category','Slug','Status','FileSize','MimeType','Width','Height',
-      'Confidence','Caption','UpdatedAt','FileUrl','Thumbnail','Hash','AspectRatio','Likes','Comments'
-    ]);
-    sh.getRange('E2:E').setDataValidation(
-      SpreadsheetApp.newDataValidation().requireValueInList(STATUS_VALUES).build()
-    );
-  }
-}
-
-// =============================
-// BUILD SHEET INDEX
-// =============================
-function buildSheetIndex_(sheet) {
-  const rows = sheet.getDataRange().getValues();
-  const idx = {};
-  const headers = rows[0];
-  for (let i = 1; i < rows.length; i++) {
-    const id = rows[i][0];
-    const hash = rows[i][14];
-    const caption = rows[i][10];
-    const likesCol = headers.indexOf('Likes');        
-    const commentsCol = headers.indexOf('Comments');  
-    idx[id] = { 
-      row: i + 1, 
-      hash, 
-      caption,
-      likes: likesCol >= 0 ? rows[i][likesCol] : 0,             
-      comments: commentsCol >= 0 ? rows[i][commentsCol] : []   
-    };
-  }
   return idx;
 }
 
-// =============================
-// SCAN FOLDERS & UPSERT FILES
-// =============================
-function scanFolderIncremental_(folder, category, index, updatedRows) {
-  const files = folder.getFiles();
-  while (files.hasNext()) upsertFileIncremental_(files.next(), category, index, updatedRows);
-}
-function scanAutoCategoriesIncremental_(folder, index, updatedRows, path) {
-  const subfolders = folder.getFolders();
-  while (subfolders.hasNext()) {
-    const sub = subfolders.next();
-    const newPath = path ? `${path}/${sub.getName()}` : sub.getName();
-    scanFolderIncremental_(sub, newPath, index, updatedRows);
-    scanAutoCategoriesIncremental_(sub, index, updatedRows, newPath);
-  }
+
+function clearIdx_(tbl) {
+
+  CacheService
+    .getScriptCache()
+    .remove(idxKey_(tbl));
 }
 
-// =============================
-// UPSERT FILE
-// =============================
-function upsertFileIncremental_(file, category, index, updatedRows) {
-  const id = file.getId();
-  const hash = makeHash_(file);
-  if (index[id] && index[id].hash === hash) return;
 
-  const resolution = getResolution_(file);
-  const aspect = calculateAspect_(resolution.width, resolution.height);
-  const size = humanSize_(file.getSize());
-  const slug = slugify_(file.getName());
-  const inferredCategory = inferCategorySmart_(file, category, resolution);
-  const confidence = scoreConfidence_(file, inferredCategory, resolution);
-  
-  const row = index[id] ? index[id].row : Object.keys(index).length + 2;
-  const manualCaption = index[id]?.caption || '';
-  const likes = index[id]?.likes || 0;            
-  const comments = index[id]?.comments || '[]';   
+function buildIdx_(tbl) {
 
-  const values = [
-    id,
-    file.getName(),
-    inferredCategory,
-    slug,
-    index[id]?.status || 'published',
-    size,
-    file.getMimeType(),
-    resolution.width,
-    resolution.height,
-    confidence,
-    manualCaption,
-    new Date().toISOString(),
-    directLink_(id),
-    thumbnailUrl_(file),
-    hash,
-    aspect,
-    likes,       
-    comments     
-  ];
+  const sh = getSysSheet_(tbl);
 
-  updatedRows.push(values);
-  index[id] = { row, hash, caption: manualCaption, likes, comments }; 
-  ISR_QUEUE.add(slug);
-}
+  const data = sh.getDataRange().getValues();
 
-/******************************************************
- * Web API endpoint for Next.js gallery consumption
- ******************************************************/
+  const idx = {};
 
-function doGet(e) {
-  const sheet = getOrCreateSheet_(); // ✅ use existing helper
-  const data = sheet.getDataRange().getValues();
-  if (data.length < 2) return createEmptyResponse_(); // no assets
+  for (let i = 1; i < data.length; i++) {
 
-  const headers = data[0];
-  const rows = data.slice(1);
+    const id = data[i][0];
 
-  const json = rows
-    .filter(row => row[headers.indexOf('FileId')]) // 🚀 ignore rows without FileId
-    .map(row => {
-      const obj = {};
-      headers.forEach((h, i) => {
-        obj[h] = row[i] !== "" && row[i] != null ? row[i] : null;
-      });
-
-      // 🚀 ensure safe defaults for new columns
-      if (!obj.Likes) obj.Likes = 0;
-      if (!obj.Comments) obj.Comments = [];
-      else obj.Comments = safeParseJSON(obj.Comments, []); // parse existing comments safely
-
-      // 🚀 infer Type from MimeType if missing
-      if (!obj.Type && obj.MimeType) obj.Type = inferTypeFromMime_(obj.MimeType);
-
-      // 🚀 ensure URL/Thumbnail
-      obj.FileUrl = obj.FileUrl || directLink_(obj.FileId);
-      obj.Thumbnail = obj.Thumbnail || thumbnailUrl_(obj);
-
-      return obj;
-    });
-
-  return ContentService
-    .createTextOutput(JSON.stringify(json))
-    .setMimeType(ContentService.MimeType.JSON);
-}
-
-// 🚀 return empty JSON safely
-function createEmptyResponse_() {
-  return ContentService.createTextOutput('[]')
-    .setMimeType(ContentService.MimeType.JSON);
-}
-
-// 🚀 infer type from mime type
-function inferTypeFromMime_(mime) {
-  const m = mime.toLowerCase();
-  if (m.startsWith('image/')) return 'image';
-  if (m.startsWith('video/')) return 'video';
-  if (m === 'application/pdf') return 'pdf';
-  return 'image';
-}
-
-// 🚀 safe JSON parse
-function safeParseJSON(str, defaultValue) {
-  try { return JSON.parse(str); } 
-  catch(e) { return defaultValue; }
-}
-
-/******************************************************
- * Utilities & Enhancements for Production
- ******************************************************/
-
-// 🚀 Get Drive file metadata (size, width, height)
-function getDriveFileMetadata(fileId) {
-  try {
-    const file = DriveApp.getFileById(fileId);
-    let width = null, height = null;
-    try {
-      const meta = Drive.Files.get(fileId, { fields: 'imageMediaMetadata' });
-      if (meta.imageMediaMetadata) {
-        width = meta.imageMediaMetadata.width || null;
-        height = meta.imageMediaMetadata.height || null;
-      }
-    } catch(e) { /* ignore for non-images */ }
-    return { size: file.getSize(), width, height };
-  } catch (err) {
-    console.error("Drive metadata error for fileId", fileId, err);
-    return { size: null, width: null, height: null };
-  }
-}
-
-// 🚀 Thumbnail helper for videos/images/PDF
-function thumbnailUrl_(file) {
-  if (file.getMimeType().startsWith('image/')) {
-    // 🆕 Stable, public, CDN-backed image URL
-    return `https://lh3.googleusercontent.com/d/${file.getId()}=w${THUMB_WIDTH}`
-  }
-  
-  // 🆕 Safe placeholder for non-images
-  return `https://via.placeholder.com/${THUMB_WIDTH}x${THUMB_HEIGHT}?text=Video`
-}
-
-// 🚀 Hash for file change detection
-function makeHash_(file) {
-  const id = file.getId();
-  const modified = file.getLastUpdated().getTime();
-  const size = file.getSize();
-  return Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, `${id}-${modified}-${size}`)
-    .map(b => (b & 0xFF).toString(16).padStart(2, '0')).join('');
-}
-
-// 🚀 Get resolution safely (used in ingestion)
-function getResolution_(file) {
-  try {
-    const meta = Drive.Files.get(file.getId(), { fields: 'imageMediaMetadata' });
-    const img = meta.imageMediaMetadata;
-    if (img && img.width && img.height) return { width: img.width, height: img.height };
-  } catch(e) {}
-  return { width: null, height: null };
-}
-
-// 🚀 Slugify helper
-function slugify_(s) {
-  return s.toLowerCase()
-    .replace(/\.[^/.]+$/, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/(^-|-$)/g, '');
-}
-
-// 🚀 Human readable file size
-function humanSize_(bytes) {
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-  if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MB';
-  return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB';
-}
-
-// 🚀 Calculate aspect ratio
-function calculateAspect_(width, height) {
-  if (!width || !height) return '';
-  const ratio = width / height;
-  if (Math.abs(ratio - 1) < 0.05) return '1:1';
-  if (Math.abs(ratio - 1.78) < 0.05) return '16:9';
-  if (Math.abs(ratio - 0.56) < 0.05) return '9:16';
-  if (Math.abs(ratio - 1.33) < 0.05) return '4:3';
-  return 'Other';
-}
-
-// 🚀 Confidence scoring (existing logic)
-function scoreConfidence_(file, category, resolution) {
-  let score = 30;
-  const name = file.getName().toLowerCase();
-  if (category !== 'Uncategorized') score += 30;
-  if (name.match(/banner|icon|hero|screenshot|logo/)) score += 20;
-  if (resolution.width && resolution.height) score += 20;
-  return Math.min(100, score);
-}
-
-// 🚀 Apply background color based on confidence
-function applyConfidenceColor_(cell, value) {
-  if (value >= 80) cell.setBackground('#4CAF50');       // Green
-  else if (value >= 50) cell.setBackground('#FFC107');  // Gold
-  else cell.setBackground('#F44336');                   // Red
-}
-/******************************************************
- * 🚀  * Time-based ingestion trigger installer
- * (REQUIRED by bootstrap)
- ******************************************************/
-function installTimeTrigger_() {
-  // Remove existing triggers to avoid duplicates
-  ScriptApp.getProjectTriggers().forEach(trigger => {
-    if (trigger.getHandlerFunction() === 'runIngestion_') {
-      ScriptApp.deleteTrigger(trigger);
+    if (id) {
+      idx[id] = i + 1;
     }
+  }
+
+  return idx;
+}
+
+
+/* =========================================================
+   CRUD CORE
+========================================================= */
+
+function dbGet_(tbl, id) {
+
+  const idx = getIdx_(tbl);
+
+  const row = idx[id];
+
+  if (!row) return null;
+
+  const sh = getSysSheet_(tbl);
+
+  const def = DB[tbl];
+
+  const v = sh
+    .getRange(row, 1, 1, def.cols.length)
+    .getValues()[0];
+
+  return rowToObj_(def, v);
+}
+
+
+function dbList_(tbl) {
+
+  const sh = getSysSheet_(tbl);
+
+  const def = DB[tbl];
+
+  const data = sh.getDataRange().getValues();
+
+  const res = [];
+
+  for (let i = 1; i < data.length; i++) {
+
+    if (!data[i][0]) continue;
+
+    res.push(rowToObj_(def, data[i]));
+  }
+
+  return res;
+}
+
+
+function dbPut_(tbl, obj) {
+
+  return dbLock_(function () {
+
+    const sh = getSysSheet_(tbl);
+
+    const def = DB[tbl];
+
+    const idx = getIdx_(tbl);
+
+    let row = idx[obj.id];
+
+    const vals = def.cols.map(c => obj[c] || "");
+
+    if (row) {
+
+      sh.getRange(row, 1, 1, vals.length)
+        .setValues([vals]);
+
+    } else {
+
+      sh.appendRow(vals);
+    }
+
+    clearIdx_(tbl);
+
+    return obj;
+  });
+}
+
+
+function dbDel_(tbl, id) {
+
+  return dbLock_(function () {
+
+    const idx = getIdx_(tbl);
+
+    const row = idx[id];
+
+    if (!row) return false;
+
+    const sh = getSysSheet_(tbl);
+
+    sh.deleteRow(row);
+
+    clearIdx_(tbl);
+
+    return true;
+  });
+}
+
+
+/* =========================================================
+   ROW HELPERS
+========================================================= */
+
+function rowToObj_(def, row) {
+
+  const o = {};
+
+  for (let i = 0; i < def.cols.length; i++) {
+    o[def.cols[i]] = row[i];
+  }
+
+  return o;
+}
+
+
+/* =========================================================
+   SEARCH TOKENIZER
+========================================================= */
+
+function tokenize_(s) {
+
+  if (!s) return [];
+
+  return String(s)
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+
+
+
+/* =========================================================
+   DRIVE INGESTION PIPELINE
+========================================================= */
+
+
+/* =========================================================
+   JOB QUEUE
+========================================================= */
+
+function newJob_(type, data) {
+
+  const job = {
+    id: uid_(),
+    type: type,
+    status: "pending",
+    data: JSON.stringify(data || {}),
+    created: now_(),
+    updated: now_()
+  };
+
+  dbPut_("jobs", job);
+
+  return job;
+}
+
+
+function nextJob_() {
+
+  const jobs = dbList_("jobs");
+
+  for (let j of jobs) {
+
+    if (j.status === "pending") {
+      return j;
+    }
+  }
+
+  return null;
+}
+
+
+function setJob_(id, status, data) {
+
+  const j = dbGet_("jobs", id);
+
+  if (!j) return;
+
+  j.status = status;
+  j.updated = now_();
+
+  if (data) {
+    j.data = JSON.stringify(data);
+  }
+
+  dbPut_("jobs", j);
+}
+
+
+/* =========================================================
+   DRIVE SCAN
+========================================================= */
+
+function scanDrive_(folderId) {
+
+  const root = folderId
+    ? DriveApp.getFolderById(folderId)
+    : DriveApp.getRootFolder();
+
+  walkFolder_(root);
+}
+
+
+function walkFolder_(folder) {
+
+  const files = folder.getFiles();
+
+  while (files.hasNext()) {
+
+    const f = files.next();
+
+    enqueueFile_(f);
+  }
+
+  const subs = folder.getFolders();
+
+  while (subs.hasNext()) {
+
+    walkFolder_(subs.next());
+  }
+}
+
+
+/* =========================================================
+   FILE QUEUE
+========================================================= */
+
+function enqueueFile_(file) {
+
+  const job = newJob_("ingest", {
+    id: file.getId(),
+    name: file.getName(),
+    mime: file.getMimeType()
   });
 
-  // Create fresh time-based trigger
-  ScriptApp.newTrigger('runIngestion_')
+  log_("Queued file " + job.id);
+}
+
+
+/* =========================================================
+   WORKER
+========================================================= */
+
+function runWorker_() {
+
+  const j = nextJob_();
+
+  if (!j) return;
+
+  try {
+
+    setJob_(j.id, "running");
+
+    const data = JSON.parse(j.data || "{}");
+
+    switch (j.type) {
+
+      case "ingest":
+        ingestFile_(data);
+        break;
+
+      case "reindex":
+        reindexAll_();
+        break;
+    }
+
+    setJob_(j.id, "done");
+
+  } catch (e) {
+
+    setJob_(j.id, "error", {
+      msg: e.message,
+      stack: e.stack
+    });
+
+    logErr_(e);
+  }
+}
+
+
+/* =========================================================
+   FILE INGESTION
+========================================================= */
+
+function ingestFile_(data) {
+
+  const fid = data.id;
+
+  const f = DriveApp.getFileById(fid);
+
+  const hash = hash_(f.getBlob().getBytes());
+
+  const existing = findByHash_(hash);
+
+  if (existing) {
+    return;
+  }
+
+  const item = {
+
+    id: uid_(),
+
+    name: f.getName(),
+
+    slug: slug_(f.getName()),
+
+    type: classify_(f),
+
+    mime: f.getMimeType(),
+
+    url: f.getUrl(),
+
+    thumb: getThumb_(f),
+
+    size: f.getSize(),
+
+    cat: "",
+
+    tags: "",
+
+    likes: 0,
+
+    comments: 0,
+
+    views: 0,
+
+    created: now_(),
+
+    updated: now_(),
+
+    status: "active",
+
+    hash: hash
+  };
+
+
+  const meta = aiMeta_(item);
+
+  if (meta) {
+
+    item.cat = meta.cat;
+    item.tags = meta.tags;
+  }
+
+  dbPut_("items", item);
+
+  queueIsr_(item.slug);
+}
+
+
+/* =========================================================
+   DEDUP
+========================================================= */
+
+function findByHash_(h) {
+
+  const list = dbList_("items");
+
+  for (let it of list) {
+
+    if (it.hash === h) {
+      return it;
+    }
+  }
+
+  return null;
+}
+
+
+/* =========================================================
+   CLASSIFICATION
+========================================================= */
+
+function classify_(file) {
+
+  const m = file.getMimeType();
+
+  if (m.indexOf("image") === 0) return "image";
+  if (m.indexOf("video") === 0) return "video";
+  if (m.indexOf("pdf") !== -1) return "pdf";
+
+  return "file";
+}
+
+
+/* =========================================================
+   THUMBNAIL
+========================================================= */
+
+function getThumb_(file) {
+
+  try {
+
+    const t = Drive.Files.get(file.getId(), {
+      fields: "thumbnailLink"
+    });
+
+    return t.thumbnailLink || "";
+
+  } catch (e) {
+
+    return "";
+  }
+}
+
+
+/* =========================================================
+   AI METADATA (GEMINI)
+========================================================= */
+
+function aiMeta_(item) {
+
+  const key = prop_("GEMINI_API_KEY");
+
+  if (!key) return null;
+
+  try {
+
+    const url =
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-vision:generateContent?key=" +
+      key;
+
+    const payload = {
+      contents: [{
+        parts: [{
+          text:
+            "Describe and categorize this file: " +
+            item.name
+        }]
+      }]
+    };
+
+    const res = UrlFetchApp.fetch(url, {
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
+
+    const json = JSON.parse(res.getContentText());
+
+    const txt =
+      json.candidates?.[0]?.content?.parts?.[0]?.text || "";
+
+    return parseMeta_(txt);
+
+  } catch (e) {
+
+    logErr_(e);
+
+    return null;
+  }
+}
+
+
+function parseMeta_(txt) {
+
+  if (!txt) return null;
+
+  const parts = txt.split("\n");
+
+  return {
+    cat: parts[0] || "",
+    tags: parts.slice(1).join(",")
+  };
+}
+
+
+/* =========================================================
+   SLUG
+========================================================= */
+
+function slug_(s) {
+
+  return String(s)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+
+/* =========================================================
+   REINDEX
+========================================================= */
+
+function reindexAll_() {
+
+  const list = dbList_("items");
+
+  for (let it of list) {
+
+    it.slug = slug_(it.name);
+
+    dbPut_("items", it);
+  }
+}
+
+
+
+
+/* =========================================================
+   PUBLIC ITEMS API
+========================================================= */
+
+function listItems_(req) {
+
+  const q = req.query;
+
+  const page = clamp_(toInt_(q.page, 1), 1, 10000);
+  const size = clamp_(toInt_(q.size, CFG.DEF_PAGE), 1, CFG.MAX_PAGE);
+
+  const cat = q.cat || "";
+  const search = q.q || "";
+
+  let list = dbList_("items");
+
+  // status filter
+  list = list.filter(i => i.status === "active");
+
+  // category filter
+  if (cat) {
+    list = list.filter(i => i.cat === cat);
+  }
+
+  // search
+  if (search) {
+
+    const tok = tokenize_(search);
+
+    list = list.filter(i => {
+
+      const s = [
+        i.name,
+        i.tags,
+        i.cat
+      ].join(" ").toLowerCase();
+
+      return tok.every(t => s.indexOf(t) !== -1);
+    });
+  }
+
+  // sort newest first
+  list.sort((a, b) => b.created - a.created);
+
+  const total = list.length;
+
+  const from = (page - 1) * size;
+
+  const items = list.slice(from, from + size);
+
+  return {
+    ok: true,
+    page: page,
+    size: size,
+    total: total,
+    items: items
+  };
+}
+
+
+/* =========================================================
+   ENGAGEMENT
+========================================================= */
+
+function handleEngage_(req) {
+
+  const b = req.body || {};
+
+  const type = needStr_(b.type, "type", 20);
+  const item = needStr_(b.item, "item", 40);
+
+  const uid = needStr_(b.user, "user", 40);
+
+  const fp = fp_(req);
+
+  const id = hash_([item, uid, type, fp].join("|"));
+
+  let rec = dbGet_("engage", id);
+
+  if (rec) {
+    return { ok: true };
+  }
+
+  rec = {
+    id: id,
+    item: item,
+    type: type,
+    user: uid,
+    val: 1,
+    created: now_()
+  };
+
+  dbPut_("engage", rec);
+
+  updateCounts_(item, type);
+
+  return { ok: true };
+}
+
+
+function updateCounts_(itemId, type) {
+
+  const it = dbGet_("items", itemId);
+
+  if (!it) return;
+
+  if (type === "like") it.likes++;
+  if (type === "comment") it.comments++;
+  if (type === "view") it.views++;
+
+  it.updated = now_();
+
+  dbPut_("items", it);
+}
+
+
+/* =========================================================
+   USERS
+========================================================= */
+
+function handleUser_(req) {
+
+  const b = req.body || {};
+
+  const email = needStr_(b.email, "email", 100);
+
+  let u = findUser_(email);
+
+  if (!u) {
+
+    u = {
+      id: uid_(),
+      email: email,
+      name: b.name || "",
+      created: now_(),
+      last: now_(),
+      meta: JSON.stringify(b.meta || {})
+    };
+
+  } else {
+
+    u.last = now_();
+  }
+
+  dbPut_("users", u);
+
+  return {
+    ok: true,
+    id: u.id
+  };
+}
+
+
+function findUser_(email) {
+
+  const list = dbList_("users");
+
+  for (let u of list) {
+
+    if (u.email === email) {
+      return u;
+    }
+  }
+
+  return null;
+}
+
+
+/* =========================================================
+   ISR (NEXT.JS REVALIDATION)
+========================================================= */
+
+const ISR_Q = [];
+
+
+function queueIsr_(slug) {
+
+  if (!slug) return;
+
+  ISR_Q.push(slug);
+
+  if (ISR_Q.length >= 10) {
+    flushIsr_();
+  }
+}
+
+
+function flushIsr_() {
+
+  if (!ISR_Q.length) return;
+
+  const url = prop_("NEXTJS_ISR_ENDPOINT");
+
+  if (!url) return;
+
+  const sec = propReq_("NEXTJS_ISR_SECRET");
+
+  const batch = ISR_Q.splice(0, ISR_Q.length);
+
+  try {
+
+    UrlFetchApp.fetch(url, {
+      method: "post",
+      contentType: "application/json",
+      headers: {
+        "x-isr-secret": sec
+      },
+      payload: JSON.stringify({
+        slugs: batch
+      }),
+      muteHttpExceptions: true
+    });
+
+  } catch (e) {
+
+    logErr_(e);
+  }
+}
+
+
+function handleIsr_() {
+
+  flushIsr_();
+
+  return { ok: true };
+}
+
+
+/* =========================================================
+   ADMIN API
+========================================================= */
+
+function handleAdmin_(req) {
+
+  const b = req.body || {};
+
+  const act = needStr_(b.action, "action", 40);
+
+  switch (act) {
+
+    case "scan":
+      scanDrive_(b.folder || null);
+      return { ok: true };
+
+    case "worker":
+      runWorker_();
+      return { ok: true };
+
+    case "reindex":
+      newJob_("reindex", {});
+      return { ok: true };
+
+    case "disable":
+      return adminDisable_(b.id);
+
+    case "enable":
+      return adminEnable_(b.id);
+
+    case "purge":
+      return adminPurge_(b.id);
+
+    default:
+      throw new Error("UNKNOWN_ADMIN_ACTION");
+  }
+}
+
+
+function adminDisable_(id) {
+
+  needStr_(id, "id", 40);
+
+  const it = dbGet_("items", id);
+
+  if (!it) throw new Error("NOT_FOUND");
+
+  it.status = "disabled";
+  it.updated = now_();
+
+  dbPut_("items", it);
+
+  queueIsr_(it.slug);
+
+  return { ok: true };
+}
+
+
+function adminEnable_(id) {
+
+  needStr_(id, "id", 40);
+
+  const it = dbGet_("items", id);
+
+  if (!it) throw new Error("NOT_FOUND");
+
+  it.status = "active";
+  it.updated = now_();
+
+  dbPut_("items", it);
+
+  queueIsr_(it.slug);
+
+  return { ok: true };
+}
+
+
+function adminPurge_(id) {
+
+  needStr_(id, "id", 40);
+
+  dbDel_("items", id);
+
+  return { ok: true };
+}
+
+
+/* =========================================================
+   BOOTSTRAP / TRIGGERS
+========================================================= */
+
+function bootstrap_() {
+
+  // ensure sheets
+  Object.keys(DB).forEach(getSysSheet_);
+
+  // worker every 5 min
+  ScriptApp.newTrigger("runWorker_")
     .timeBased()
-    .everyMinutes(SCAN_INTERVAL_MINUTES)
+    .everyMinutes(5)
+    .create();
+
+  // ISR flush every 10 min
+  ScriptApp.newTrigger("flushIsr_")
+    .timeBased()
+    .everyMinutes(10)
     .create();
 }
 
-/******************************************************
- * Bulk Download & Comments
- ******************************************************/
 
-// =============================
-// 🚀 BULK DOWNLOAD (ZIP a folder) 
-// Usage: provide folderId, returns a downloadable Blob
-// Note: may timeout for >~500 files; for large sets, use paginated batching
-// =============================
-function bulkDownloadFolder(folderId) {
-  const folder = DriveApp.getFolderById(folderId);
-  const files = folder.getFiles();
-  const blobs = [];
-  while (files.hasNext()) {
-    const file = files.next();
-    blobs.push(file.getBlob());
-  }
-  const zip = Utilities.zip(blobs, folder.getName() + '.zip');
-  return zip; // Blob can be sent via web app response
+function resetTriggers_() {
+
+  ScriptApp.getProjectTriggers()
+    .forEach(t => ScriptApp.deleteTrigger(t));
+
+  bootstrap_();
 }
 
-// =============================
-// 🚀 COMMENTS HANDLING
-// - Read/Write comments stored as JSON in "Comments" column
-// - Each comment: { user: "Name or email", text: "Comment", date: ISOString }
-// =============================
-function getComments(fileId) {
-  const sheet = getOrCreateSheet_();
-  const data = sheet.getDataRange().getValues();
-  const headers = data[0];
-  const rowIndex = data.findIndex(r => r[0] === fileId);
-  if (rowIndex < 1) return [];
-  const commentsCol = headers.indexOf('Comments');
-  if (commentsCol < 0) return [];
-  return safeParseJSON(data[rowIndex][commentsCol], []);
-}
 
-function addComment(fileId, user, text) {
-  const sheet = getOrCreateSheet_();
-  const data = sheet.getDataRange().getValues();
-  const headers = data[0];
-  const rowIndex = data.findIndex(r => r[0] === fileId);
-  if (rowIndex < 1) return false;
-  const commentsCol = headers.indexOf('Comments');
-  if (commentsCol < 0) return false;
-  
-  const existingComments = safeParseJSON(data[rowIndex][commentsCol], []);
-  existingComments.push({ user, text, date: new Date().toISOString() });
-  sheet.getRange(rowIndex + 1, commentsCol + 1).setValue(JSON.stringify(existingComments));
-  return true;
-}
 
-// =============================
-// 🚀 ISR QUEUE ENHANCEMENTS FOR HIGH VOLUME
-// =============================
-function pushNextJSRevalidate_(slug) {
-  assertInternalCall_(); // cannot be called externally
-  if (!NEXTJS_REVALIDATE_URL || !slug) return;
-  try {
-    // Add small delay to avoid overloading Next.js on large batches
-    Utilities.sleep(50);
-    UrlFetchApp.fetch(
-      `${NEXTJS_REVALIDATE_URL}?slug=${encodeURIComponent(slug)}&secret=${encodeURIComponent(ISR_SECRET)}`,
-      { method: 'post', muteHttpExceptions: true }
-    );
-  } catch (err) {
-    Logger.log('Next.js revalidate error: ' + err);
-  }
-}
-
-// =============================
-// 🚀 SAFE PARSING UTIL (already used in previous chunks, included here for reference)
-function safeParseJSON(str, defaultValue) {
-  try { return JSON.parse(str); } 
-  catch(e) { return defaultValue; }
-}
