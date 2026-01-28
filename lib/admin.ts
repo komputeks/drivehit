@@ -1,32 +1,22 @@
 export async function adminCall(
-  path: string,
+  action: string,
   payload?: any
 ) {
-
-  const email =
-    localStorage.getItem("admin");
-
-  if (!email) {
-    throw new Error("Not logged in");
-  }
-
   const res = await fetch("/api/gas", {
     method: "POST",
-
-    headers: {
-      "content-type": "application/json"
-    },
-
+    headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      email,
-      path,
-      payload
+      action,
+      payload,
+      email: localStorage.getItem("admin") || ""
     })
   });
 
-  if (!res.ok) {
-    throw new Error("Request failed");
+  const data = await res.json();
+
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || "Admin API failed");
   }
 
-  return res.json();
+  return data.data;
 }

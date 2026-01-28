@@ -8,13 +8,13 @@ import { callGas, isAdmin } from "@/lib/core";
 ================================ */
 
 const ACTIONS: Record<string, string> = {
-
   stats:   "/v1/admin/stats",
   ingest:  "/v1/admin/ingest",
   items:   "/v1/admin/items",
   jobs:    "/v1/admin/jobs",
-  reindex: "/v1/admin/reindex"
-
+  reindex: "/v1/admin/reindex",
+  errors:  "/v1/admin/errors",
+  retryJob:"/v1/admin/jobs/retry"
 };
 
 /* ===============================
