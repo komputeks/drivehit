@@ -1,15 +1,11 @@
-export async function adminCall(
-  action: string,
-  payload?: any
-) {
+// lib/admin.ts
+export async function adminCall(action: string, payload?: any) {
+  const email = localStorage.getItem("admin") || "";
+
   const res = await fetch("/api/gas", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      action,
-      payload,
-      email: localStorage.getItem("admin") || ""
-    })
+    body: JSON.stringify({ action, payload, email })
   });
 
   const data = await res.json();
