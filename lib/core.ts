@@ -1,49 +1,119 @@
 import crypto from "crypto";
 
-/* ENV */
+/* ===============================
+   ENV
+================================ */
 
 export const env = {
-  secret: process.env.API_SECRET!,
+  // Public GAS endpoint
+  gasBase: process.env.NEXT_PUBLIC_API_BASE_URL!,
+
+  // Secrets
+  signSecret: process.env.API_SIGNING_SECRET!,
+  readSecret: process.env.API_READ_SECRET!,
+
+  // Admin
   admins: process.env.ADMIN_EMAILS!.split(","),
-  gas: process.env.GAS_URL!
+
+  // ISR
+  isrSecret: process.env.NEXTJS_ISR_SECRET!
 };
 
-/* SECURITY */
+/* ===============================
+   HMAC SIGN
+================================ */
 
-export function sign(data: string) {
+export function sign(payload: string) {
+
   return crypto
-    .createHmac("sha256", env.secret)
-    .update(data)
+    .createHmac("sha256", env.signSecret)
+    .update(payload)
     .digest("hex");
 }
 
-/* ADMIN CHECK */
+/* ===============================
+   ADMIN CHECK
+================================ */
 
 export function isAdmin(email?: string | null) {
+
   if (!email) return false;
-  return env.admins.includes(email);
+
+  return env.admins.includes(email.trim());
 }
 
-/* GAS CLIENT */
+/* ===============================
+   GAS CALL
+================================ */
 
 export async function callGas(
   path: string,
-  body: any
+  data: any,
+  method: "POST" | "GET" = "POST"
 ) {
+
   const ts = Date.now().toString();
 
-  const base = ts + JSON.stringify(body || {});
+  const body = data
+    ? JSON.stringify(data)
+    : "";
+
+  const base = [
+    method,
+    path,
+    ts,
+    body
+  ].join("|");
+
   const sig = sign(base);
 
-  const res = await fetch(env.gas + path, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-ts": ts,
-      "x-sig": sig
-    },
-    body: JSON.stringify(body)
-  });
+  const res = await fetch(
+    env.gasBase + path,
+    {
+      method,
+
+      headers: {
+        "content-type": "application/json",
+
+        "x-ts": ts,
+        "x-sig": sig,
+        "x-read-key": env.readSecret
+      },
+
+      body: method === "POST" ? body : undefined
+    }
+  );
+
+  if (!res.ok) {
+
+    const txt = await res.text();
+
+    throw new Error(
+      "GAS error: " + txt
+    );
+  }
 
   return res.json();
+}
+
+/* ===============================
+   ISR TRIGGER
+================================ */
+
+export async function triggerISR(path: string) {
+
+  const res = await fetch(
+    "/api/revalidate",
+    {
+      method: "POST",
+
+      headers: {
+        "x-secret": env.isrSecret
+      },
+
+      body: JSON.stringify({ path })
+    }
+  );
+
+  return res.ok;
 }
