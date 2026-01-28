@@ -1,16 +1,21 @@
-import { redirect } from "next/navigation";
 import { cookies } from "next/headers";
+import { redirect } from "next/navigation";
 import Link from "next/link";
 
-export default function AdminLayout({
+export default async function AdminLayout({
   children
 }: {
   children: React.ReactNode;
 }) {
 
-  const cookie = cookies().get("admin");
+  /* Get cookie store */
+  const store = await cookies();
 
-  if (!cookie) {
+  /* Read admin cookie */
+  const admin = store.get("admin");
+
+  /* Not logged in → redirect */
+  if (!admin) {
     redirect("/login");
   }
 
@@ -28,6 +33,7 @@ export default function AdminLayout({
           <Link href="/admin">Dashboard</Link>
           <Link href="/admin/items">Items</Link>
           <Link href="/admin/jobs">Jobs</Link>
+          <Link href="/admin/settings">Settings</Link>
 
         </nav>
       </aside>
@@ -39,3 +45,4 @@ export default function AdminLayout({
     </div>
   );
 }
+

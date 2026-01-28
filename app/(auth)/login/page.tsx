@@ -11,22 +11,24 @@ export default function Login() {
 
   async function submit() {
 
-    setErr("");
+  setErr("");
 
-    const res = await fetch("/api/auth", {
-      method: "POST",
-      body: JSON.stringify({ email })
-    });
+  const res = await fetch("/api/auth", {
+    method: "POST",
+    body: JSON.stringify({ email })
+  });
 
-    if (!res.ok) {
-      setErr("Access denied");
-      return;
-    }
-
-    localStorage.setItem("admin", email);
-
-    router.push("/admin");
+  if (!res.ok) {
+    setErr("Access denied");
+    return;
   }
+
+  /* Set cookie via document */
+  document.cookie =
+    `admin=${email}; path=/; max-age=604800; samesite=lax`;
+
+  router.push("/admin");
+}
 
   return (
     <main className="container max-w-md">
