@@ -1,49 +1,33 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { adminCall } from "@/lib/admin";
 
 export default function Admin() {
 
-  const [stats, setStats] = useState<any>(null);
+  const [stats, setStats] = useState<any>();
   const [err, setErr] = useState("");
+
+  useEffect(() => {
+
+    load();
+
+  }, []);
 
   async function load() {
 
     try {
 
-      const res = await fetch("/api/admin", {
-        method: "POST",
-        body: JSON.stringify({
-          action: "stats"
-        })
-      });
+      const d = await adminCall(
+        "/v1/stats"
+      );
 
-      const data = await res.json();
-
-      if (!res.ok) throw data;
-
-      setStats(data);
+      setStats(d);
 
     } catch (e: any) {
-      setErr("Failed to load stats");
+      setErr(e.message);
     }
   }
-
-  async function ingest() {
-
-    await fetch("/api/admin", {
-      method: "POST",
-      body: JSON.stringify({
-        action: "ingest"
-      })
-    });
-
-    alert("Ingestion started");
-  }
-
-  useEffect(() => {
-    load();
-  }, []);
 
   return (
     <div>
@@ -58,40 +42,50 @@ export default function Admin() {
         </p>
       )}
 
+      {!stats && (
+        <p>Loading...</p>
+      )}
+
       {stats && (
 
-        <div className="grid grid-cols-3 gap-4 mb-6">
+        <div className="grid grid-cols-3 gap-4">
 
-          <div className="card">
-            <h3>Total Items</h3>
-            <p className="text-2xl mt-2">
-              {stats.items}
-            </p>
-          </div>
+          <Stat
+            label="Items"
+            value={stats.items}
+          />
 
-          <div className="card">
-            <h3>Jobs</h3>
-            <p className="text-2xl mt-2">
-              {stats.jobs}
-            </p>
-          </div>
+          <Stat
+            label="Jobs"
+            value={stats.jobs}
+          />
 
-          <div className="card">
-            <h3>Errors</h3>
-            <p className="text-2xl mt-2">
-              {stats.errors}
-            </p>
-          </div>
+          <Stat
+            label="Errors"
+            value={stats.errors}
+          />
 
         </div>
       )}
+    </div>
+  );
+}
 
-      <button
-        onClick={ingest}
-        className="btn"
-      >
-        Start Ingestion
-      </button>
+/* ===================== */
+
+function Stat({
+  label,
+  value
+}: any) {
+
+  return (
+    <div className="card">
+
+      <h3>{label}</h3>
+
+      <p className="text-2xl mt-2">
+        {value ?? 0}
+      </p>
 
     </div>
   );

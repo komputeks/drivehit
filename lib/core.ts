@@ -4,20 +4,31 @@ import crypto from "crypto";
    ENV
 ================================ */
 
+function must(name: string) {
+
+  const v = process.env[name];
+
+  if (!v) {
+    throw new Error(
+      `Missing env: ${name}`
+    );
+  }
+
+  return v;
+}
+
 export const env = {
-  // Public GAS endpoint
-  gasBase: process.env.NEXT_PUBLIC_API_BASE_URL!,
+  gasBase: must("NEXT_PUBLIC_API_BASE_URL"),
 
-  // Secrets
-  signSecret: process.env.API_SIGNING_SECRET!,
-  readSecret: process.env.API_READ_SECRET!,
+  signSecret: must("API_SIGNING_SECRET"),
 
-  // Admin
-  admins: process.env.ADMIN_EMAILS!.split(","),
+  readSecret: must("API_READ_SECRET"),
 
-  // ISR
-  isrSecret: process.env.NEXTJS_ISR_SECRET!
+  admins: must("ADMIN_EMAILS").split(","),
+
+  isrSecret: must("NEXTJS_ISR_SECRET")
 };
+
 
 /* ===============================
    HMAC SIGN

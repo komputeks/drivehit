@@ -1,63 +1,71 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { adminCall } from "@/lib/admin";
 
 export default function Items() {
 
-  const [list, setList] = useState<any[]>([]);
-
-  async function load() {
-
-    const res = await fetch("/api/admin", {
-      method: "POST",
-      body: JSON.stringify({
-        action: "items",
-        payload: { page: 1 }
-      })
-    });
-
-    const data = await res.json();
-
-    setList(data.items || []);
-  }
+  const [items, setItems] = useState<any[]>([]);
+  const [page, setPage] = useState(1);
 
   useEffect(() => {
     load();
-  }, []);
+  }, [page]);
+
+  async function load() {
+
+    const d = await adminCall(
+      "/v1/items",
+      { page }
+    );
+
+    setItems(d.items || []);
+  }
 
   return (
     <div>
 
-      <h1 className="text-2xl font-bold mb-4">
+      <h1 className="text-2xl mb-4">
         Items
       </h1>
 
       <div className="space-y-3">
 
-        {list.map(it => (
+        {items.map(i => (
 
           <div
-            key={it.id}
-            className="card flex justify-between"
+            key={i.id}
+            className="card"
           >
-            <div>
-              <p className="font-medium">
-                {it.title}
-              </p>
 
-              <p className="text-sm text-slate-400">
-                {it.type}
-              </p>
-            </div>
+            <p>{i.title}</p>
 
-            <span>
-              {it.status}
-            </span>
+            <p className="text-sm text-slate-400">
+              {i.type}
+            </p>
 
           </div>
         ))}
       </div>
 
+      <div className="flex gap-2 mt-4">
+
+        <button
+          className="btn"
+          onClick={() => setPage(p => p - 1)}
+          disabled={page === 1}
+        >
+          Prev
+        </button>
+
+        <button
+          className="btn"
+          onClick={() => setPage(p => p + 1)}
+        >
+          Next
+        </button>
+
+      </div>
     </div>
   );
 }
