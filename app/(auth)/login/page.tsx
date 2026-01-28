@@ -15,6 +15,9 @@ export default function Login() {
 
   const res = await fetch("/api/auth", {
     method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
     body: JSON.stringify({ email })
   });
 
@@ -22,10 +25,6 @@ export default function Login() {
     setErr("Access denied");
     return;
   }
-
-  /* Set cookie via document */
-  document.cookie =
-    `admin=${email}; path=/; max-age=604800; samesite=lax`;
 
   router.push("/admin");
 }

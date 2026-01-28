@@ -8,14 +8,12 @@ export default async function AdminLayout({
   children: React.ReactNode;
 }) {
 
-  /* Get cookie store */
+  /* Next 16 async cookies */
   const store = await cookies();
 
-  /* Read admin cookie */
   const admin = store.get("admin");
 
-  /* Not logged in → redirect */
-  if (!admin) {
+  if (!admin?.value) {
     redirect("/login");
   }
 
@@ -36,6 +34,7 @@ export default async function AdminLayout({
           <Link href="/admin/settings">Settings</Link>
 
         </nav>
+
       </aside>
 
       <main className="flex-1 p-6">
@@ -45,4 +44,3 @@ export default async function AdminLayout({
     </div>
   );
 }
-
